@@ -8,7 +8,9 @@ BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")
 POLLING_INTERVAL = int(os.getenv("POLLING_INTERVAL", "30"))
 
 PREDICT_WEB_URL = "https://predict.fun"
-BSCSCAN_API_URL = "https://api.bscscan.com/api"
+# Etherscan API V2 (supports BSC with chainid=56)
+BSCSCAN_API_URL = "https://api.etherscan.io/v2/api"
+BSC_CHAIN_ID = "56"
 
 # Predict.fun contract addresses on BNB Mainnet
 PREDICT_CONTRACTS = {

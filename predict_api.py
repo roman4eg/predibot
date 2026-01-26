@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from config import (
     BSCSCAN_API_URL,
     BSCSCAN_API_KEY,
+    BSC_CHAIN_ID,
     PREDICT_WEB_URL,
     PREDICT_CONTRACTS,
     MONITORED_CONTRACTS,
@@ -53,6 +54,8 @@ class BscScanAPI:
 
     async def _request(self, params: dict) -> dict:
         session = await self._get_session()
+        # Add chainid for Etherscan V2 API
+        params["chainid"] = BSC_CHAIN_ID
         if self.api_key:
             params["apikey"] = self.api_key
         async with session.get(self.api_url, params=params) as response:
