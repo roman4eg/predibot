@@ -29,19 +29,12 @@ async def init_db():
             )
         """)
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS seen_orders (
+            CREATE TABLE IF NOT EXISTS seen_transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 wallet_address TEXT NOT NULL,
-                order_hash TEXT NOT NULL,
-                UNIQUE(wallet_address, order_hash)
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS seen_positions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                wallet_address TEXT NOT NULL,
-                position_id TEXT NOT NULL,
-                UNIQUE(wallet_address, position_id)
+                tx_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(wallet_address, tx_hash)
             )
         """)
         await db.commit()
@@ -133,46 +126,23 @@ async def toggle_positions(chat_id: int, wallet_address: str, enabled: bool) -> 
         return cursor.rowcount > 0
 
 
-async def is_order_seen(wallet_address: str, order_hash: str) -> bool:
-    """Check if an order has been seen before."""
+async def is_tx_seen(wallet_address: str, tx_hash: str) -> bool:
+    """Check if a transaction has been seen before."""
     async with aiosqlite.connect(DATABASE_FILE) as db:
         cursor = await db.execute(
-            "SELECT 1 FROM seen_orders WHERE wallet_address = ? AND order_hash = ?",
-            (wallet_address.lower(), order_hash)
+            "SELECT 1 FROM seen_transactions WHERE wallet_address = ? AND tx_hash = ?",
+            (wallet_address.lower(), tx_hash.lower())
         )
         return await cursor.fetchone() is not None
 
 
-async def mark_order_seen(wallet_address: str, order_hash: str):
-    """Mark an order as seen."""
+async def mark_tx_seen(wallet_address: str, tx_hash: str):
+    """Mark a transaction as seen."""
     async with aiosqlite.connect(DATABASE_FILE) as db:
         try:
             await db.execute(
-                "INSERT INTO seen_orders (wallet_address, order_hash) VALUES (?, ?)",
-                (wallet_address.lower(), order_hash)
-            )
-            await db.commit()
-        except aiosqlite.IntegrityError:
-            pass
-
-
-async def is_position_seen(wallet_address: str, position_id: str) -> bool:
-    """Check if a position has been seen before."""
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        cursor = await db.execute(
-            "SELECT 1 FROM seen_positions WHERE wallet_address = ? AND position_id = ?",
-            (wallet_address.lower(), position_id)
-        )
-        return await cursor.fetchone() is not None
-
-
-async def mark_position_seen(wallet_address: str, position_id: str):
-    """Mark a position as seen."""
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        try:
-            await db.execute(
-                "INSERT INTO seen_positions (wallet_address, position_id) VALUES (?, ?)",
-                (wallet_address.lower(), position_id)
+                "INSERT INTO seen_transactions (wallet_address, tx_hash) VALUES (?, ?)",
+                (wallet_address.lower(), tx_hash.lower())
             )
             await db.commit()
         except aiosqlite.IntegrityError:

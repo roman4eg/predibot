@@ -1,179 +1,185 @@
 import aiohttp
 from typing import Optional
 from dataclasses import dataclass
-from config import PREDICT_API_BASE_URL, PREDICT_API_KEY, PREDICT_WEB_URL
+from config import (
+    BSCSCAN_API_URL,
+    BSCSCAN_API_KEY,
+    PREDICT_WEB_URL,
+    PREDICT_CONTRACTS,
+    MONITORED_CONTRACTS,
+)
 
 
 @dataclass
-class Order:
-    order_hash: str
-    maker: str
-    token_id: str
-    market_slug: str
-    market_title: str
-    outcome: str
-    side: str  # BUY or SELL
-    price_per_share: float
-    shares_amount: float
-    total_value: float
-    status: str
-    created_at: str
+class Transaction:
+    tx_hash: str
+    block_number: str
+    timestamp: str
+    from_address: str
+    to_address: str
+    value: float
+    contract_address: str
+    method_id: str
+    function_name: str
+    is_error: bool
 
     @property
     def url(self) -> str:
-        return f"{PREDICT_WEB_URL}/market/{self.market_slug}"
-
-
-@dataclass
-class Position:
-    position_id: str
-    maker: str
-    market_slug: str
-    market_title: str
-    outcome: str
-    shares_amount: float
-    avg_price: float
-    total_value: float
-    current_price: float
-    pnl: float
-    created_at: str
+        return f"https://bscscan.com/tx/{self.tx_hash}"
 
     @property
-    def url(self) -> str:
-        return f"{PREDICT_WEB_URL}/market/{self.market_slug}"
+    def contract_name(self) -> str:
+        to_lower = self.to_address.lower()
+        for name, addr in PREDICT_CONTRACTS.items():
+            if addr.lower() == to_lower:
+                return name.replace("_", " ").title()
+        return "Unknown Contract"
 
 
-class PredictAPI:
+class BscScanAPI:
     def __init__(self):
-        self.base_url = PREDICT_API_BASE_URL
-        self.api_key = PREDICT_API_KEY
+        self.api_url = BSCSCAN_API_URL
+        self.api_key = BSCSCAN_API_KEY
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            headers = {}
-            if self.api_key:
-                headers["x-api-key"] = self.api_key
-            self._session = aiohttp.ClientSession(headers=headers)
+            self._session = aiohttp.ClientSession()
         return self._session
 
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def _request(self, method: str, endpoint: str, params: dict = None) -> dict:
+    async def _request(self, params: dict) -> dict:
         session = await self._get_session()
-        url = f"{self.base_url}{endpoint}"
-        async with session.request(method, url, params=params) as response:
+        if self.api_key:
+            params["apikey"] = self.api_key
+        async with session.get(self.api_url, params=params) as response:
             if response.status == 200:
-                return await response.json()
-            elif response.status == 404:
-                return {"data": []}
+                data = await response.json()
+                if data.get("status") == "1":
+                    return data.get("result", [])
+                elif data.get("message") == "No transactions found":
+                    return []
+                else:
+                    return []
             else:
                 text = await response.text()
-                raise Exception(f"API request failed: {response.status} - {text}")
+                raise Exception(f"BscScan API request failed: {response.status} - {text}")
 
-    async def get_orders_by_maker(self, maker_address: str) -> list[Order]:
-        """Get all orders for a specific maker address."""
+    async def get_transactions(self, address: str, start_block: int = 0) -> list[Transaction]:
+        """Get all transactions for a wallet address."""
         try:
-            data = await self._request("GET", "/orders", params={"maker": maker_address})
-            orders = []
-            for item in data.get("data", data.get("orders", [])):
-                order = self._parse_order(item, maker_address)
-                if order:
-                    orders.append(order)
-            return orders
+            params = {
+                "module": "account",
+                "action": "txlist",
+                "address": address,
+                "startblock": start_block,
+                "endblock": 99999999,
+                "sort": "desc",
+                "page": 1,
+                "offset": 100,
+            }
+            results = await self._request(params)
+            transactions = []
+            for item in results:
+                tx = self._parse_transaction(item)
+                if tx and tx.to_address.lower() in MONITORED_CONTRACTS:
+                    transactions.append(tx)
+            return transactions
         except Exception as e:
-            print(f"Error fetching orders for {maker_address}: {e}")
+            print(f"Error fetching transactions for {address}: {e}")
             return []
 
-    async def get_positions_by_maker(self, maker_address: str) -> list[Position]:
-        """Get all positions for a specific maker address."""
+    async def get_internal_transactions(self, address: str, start_block: int = 0) -> list[Transaction]:
+        """Get internal transactions for a wallet address."""
         try:
-            data = await self._request("GET", "/positions", params={"maker": maker_address})
-            positions = []
-            for item in data.get("data", data.get("positions", [])):
-                position = self._parse_position(item, maker_address)
-                if position:
-                    positions.append(position)
-            return positions
+            params = {
+                "module": "account",
+                "action": "txlistinternal",
+                "address": address,
+                "startblock": start_block,
+                "endblock": 99999999,
+                "sort": "desc",
+                "page": 1,
+                "offset": 100,
+            }
+            results = await self._request(params)
+            transactions = []
+            for item in results:
+                tx = self._parse_transaction(item)
+                if tx:
+                    transactions.append(tx)
+            return transactions
         except Exception as e:
-            print(f"Error fetching positions for {maker_address}: {e}")
+            print(f"Error fetching internal transactions for {address}: {e}")
             return []
 
-    async def get_market_activity(self, maker_address: str) -> list[dict]:
-        """Get market activity for a specific maker address."""
+    async def get_token_transfers(self, address: str, start_block: int = 0) -> list[dict]:
+        """Get ERC20 token transfers for a wallet address."""
         try:
-            data = await self._request("GET", "/activity", params={"maker": maker_address})
-            return data.get("data", data.get("activity", []))
+            params = {
+                "module": "account",
+                "action": "tokentx",
+                "address": address,
+                "startblock": start_block,
+                "endblock": 99999999,
+                "sort": "desc",
+                "page": 1,
+                "offset": 100,
+            }
+            results = await self._request(params)
+            transfers = []
+            for item in results:
+                # Filter for USDT transfers to/from Predict contracts
+                contract_addr = item.get("contractAddress", "").lower()
+                to_addr = item.get("to", "").lower()
+                from_addr = item.get("from", "").lower()
+
+                if contract_addr == PREDICT_CONTRACTS["USDT"].lower():
+                    if to_addr in MONITORED_CONTRACTS or from_addr in MONITORED_CONTRACTS:
+                        transfers.append({
+                            "tx_hash": item.get("hash", ""),
+                            "block_number": item.get("blockNumber", ""),
+                            "timestamp": item.get("timeStamp", ""),
+                            "from": item.get("from", ""),
+                            "to": item.get("to", ""),
+                            "value": float(item.get("value", 0)) / 1e18,
+                            "token_symbol": item.get("tokenSymbol", ""),
+                            "token_decimal": item.get("tokenDecimal", "18"),
+                        })
+            return transfers
         except Exception as e:
-            print(f"Error fetching activity for {maker_address}: {e}")
+            print(f"Error fetching token transfers for {address}: {e}")
             return []
 
-    def _parse_order(self, item: dict, maker_address: str) -> Optional[Order]:
-        """Parse order data from API response."""
+    def _parse_transaction(self, item: dict) -> Optional[Transaction]:
+        """Parse transaction data from BscScan API response."""
         try:
-            maker_amount = float(item.get("makerAmount", 0)) / 1e6  # USDT has 6 decimals
-            taker_amount = float(item.get("takerAmount", 0)) / 1e6
-            price_per_share = float(item.get("pricePerShare", item.get("price", 0)))
+            value_wei = int(item.get("value", 0))
+            value_bnb = value_wei / 1e18
 
-            if maker_amount > 0:
-                shares = maker_amount / price_per_share if price_per_share > 0 else 0
-            else:
-                shares = taker_amount / (1 - price_per_share) if price_per_share < 1 else 0
+            input_data = item.get("input", "")
+            method_id = input_data[:10] if len(input_data) >= 10 else ""
+            function_name = item.get("functionName", "").split("(")[0] if item.get("functionName") else ""
 
-            market = item.get("market", {})
-            outcome_token = item.get("outcomeToken", {})
-
-            return Order(
-                order_hash=item.get("hash", item.get("id", "")),
-                maker=item.get("maker", maker_address),
-                token_id=item.get("tokenId", ""),
-                market_slug=market.get("slug", item.get("marketSlug", "")),
-                market_title=market.get("title", item.get("marketTitle", "Unknown Market")),
-                outcome=outcome_token.get("name", item.get("outcome", "Unknown")),
-                side=item.get("side", "BUY"),
-                price_per_share=price_per_share,
-                shares_amount=shares,
-                total_value=maker_amount if maker_amount > 0 else taker_amount,
-                status=item.get("status", "OPEN"),
-                created_at=item.get("createdAt", item.get("timestamp", ""))
+            return Transaction(
+                tx_hash=item.get("hash", ""),
+                block_number=item.get("blockNumber", ""),
+                timestamp=item.get("timeStamp", ""),
+                from_address=item.get("from", ""),
+                to_address=item.get("to", ""),
+                value=value_bnb,
+                contract_address=item.get("contractAddress", ""),
+                method_id=method_id,
+                function_name=function_name,
+                is_error=item.get("isError", "0") == "1",
             )
         except Exception as e:
-            print(f"Error parsing order: {e}")
-            return None
-
-    def _parse_position(self, item: dict, maker_address: str) -> Optional[Position]:
-        """Parse position data from API response."""
-        try:
-            market = item.get("market", {})
-            outcome_token = item.get("outcomeToken", {})
-
-            shares = float(item.get("shares", item.get("amount", 0))) / 1e6
-            avg_price = float(item.get("avgPrice", item.get("averagePrice", 0)))
-            current_price = float(item.get("currentPrice", item.get("price", avg_price)))
-            total_value = shares * avg_price
-            pnl = shares * (current_price - avg_price)
-
-            position_id = item.get("id", f"{item.get('marketId', '')}-{item.get('tokenId', '')}")
-
-            return Position(
-                position_id=position_id,
-                maker=item.get("maker", maker_address),
-                market_slug=market.get("slug", item.get("marketSlug", "")),
-                market_title=market.get("title", item.get("marketTitle", "Unknown Market")),
-                outcome=outcome_token.get("name", item.get("outcome", "Unknown")),
-                shares_amount=shares,
-                avg_price=avg_price,
-                total_value=total_value,
-                current_price=current_price,
-                pnl=pnl,
-                created_at=item.get("createdAt", item.get("timestamp", ""))
-            )
-        except Exception as e:
-            print(f"Error parsing position: {e}")
+            print(f"Error parsing transaction: {e}")
             return None
 
 
 # Global API instance
-predict_api = PredictAPI()
+bscscan_api = BscScanAPI()

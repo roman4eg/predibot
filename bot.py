@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -9,7 +10,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from config import TELEGRAM_BOT_TOKEN, POLLING_INTERVAL
+from config import TELEGRAM_BOT_TOKEN, POLLING_INTERVAL, PREDICT_CONTRACTS
 from database import (
     init_db,
     add_wallet,
@@ -18,13 +19,11 @@ from database import (
     get_all_wallets,
     toggle_orders,
     toggle_positions,
-    is_order_seen,
-    mark_order_seen,
-    is_position_seen,
-    mark_position_seen,
+    is_tx_seen,
+    mark_tx_seen,
     get_wallet_by_address,
 )
-from predict_api import predict_api, Order, Position
+from predict_api import bscscan_api, Transaction
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -37,41 +36,43 @@ WALLET_ADDRESS_PATTERN = re.compile(r"^0x[a-fA-F0-9]{40}$")
 # Global tracking task reference
 _tracking_task: asyncio.Task | None = None
 
+# Method signatures for Predict.fun contracts
+METHOD_SIGNATURES = {
+    "0x0d5a5dba": "fillOrder",
+    "0x64a3d245": "fillOrders",
+    "0x2e0ae375": "matchOrders",
+    "0xd2539b37": "cancel",
+    "0x3644e515": "DOMAIN_SEPARATOR",
+    "0xa9059cbb": "transfer",
+    "0x23b872dd": "transferFrom",
+    "0x095ea7b3": "approve",
+}
+
 
 def is_valid_address(address: str) -> bool:
     """Validate Ethereum/BNB wallet address format."""
     return bool(WALLET_ADDRESS_PATTERN.match(address))
 
 
-def format_order_message(order: Order, wallet_name: str) -> str:
-    """Format order notification message."""
-    side_emoji = "BUY" if order.side == "BUY" else "SELL"
-    return (
-        f"**New Order** | {wallet_name}\n\n"
-        f"**Market:** [{order.market_title}]({order.url})\n"
-        f"**Outcome:** {order.outcome}\n"
-        f"**Side:** {side_emoji}\n"
-        f"**Price per share:** ${order.price_per_share:.4f}\n"
-        f"**Shares:** {order.shares_amount:.2f}\n"
-        f"**Total value:** ${order.total_value:.2f}\n"
-        f"**Status:** {order.status}\n\n"
-        f"[View on Predict.fun]({order.url})"
-    )
+def get_method_name(method_id: str) -> str:
+    """Get human-readable method name from method ID."""
+    return METHOD_SIGNATURES.get(method_id, method_id)
 
 
-def format_position_message(position: Position, wallet_name: str) -> str:
-    """Format position notification message."""
-    pnl_emoji = "+" if position.pnl >= 0 else ""
+def format_transaction_message(tx: Transaction, wallet_name: str) -> str:
+    """Format transaction notification message."""
+    timestamp = datetime.fromtimestamp(int(tx.timestamp)).strftime("%Y-%m-%d %H:%M:%S")
+    method_name = tx.function_name or get_method_name(tx.method_id)
+    status = "Failed" if tx.is_error else "Success"
+
     return (
-        f"**New Position** | {wallet_name}\n\n"
-        f"**Market:** [{position.market_title}]({position.url})\n"
-        f"**Outcome:** {position.outcome}\n"
-        f"**Shares:** {position.shares_amount:.2f}\n"
-        f"**Avg price:** ${position.avg_price:.4f}\n"
-        f"**Current price:** ${position.current_price:.4f}\n"
-        f"**Total value:** ${position.total_value:.2f}\n"
-        f"**PnL:** {pnl_emoji}${position.pnl:.2f}\n\n"
-        f"[View on Predict.fun]({position.url})"
+        f"**New Transaction** | {wallet_name}\n\n"
+        f"**Contract:** {tx.contract_name}\n"
+        f"**Method:** `{method_name}`\n"
+        f"**Status:** {status}\n"
+        f"**Time:** {timestamp}\n"
+        f"**Tx Hash:** `{tx.tx_hash[:16]}...`\n\n"
+        f"[View on BscScan]({tx.url})"
     )
 
 
@@ -79,11 +80,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
     await update.message.reply_text(
         "Welcome to Predict.fun Wallet Tracker Bot!\n\n"
+        "Track wallet activity on Predict.fun prediction market.\n\n"
         "**Commands:**\n"
         "/add <address> <name> - Add wallet to track\n"
         "/remove <address> - Remove wallet from tracking\n"
         "/list - List all tracked wallets\n"
-        "/settings <address> - Manage notification settings\n"
+        "/settings - Manage notification settings\n"
         "/help - Show this help message\n\n"
         "Example:\n"
         "`/add 0x1234...abcd MyWallet`",
@@ -121,7 +123,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if success:
         await update.message.reply_text(
             f"Wallet **{name}** (`{address[:8]}...{address[-6:]}`) added successfully!\n\n"
-            f"You will receive notifications for new orders and positions.",
+            f"You will receive notifications for Predict.fun transactions.",
             parse_mode="Markdown"
         )
     else:
@@ -327,40 +329,51 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-async def check_wallet_updates(app: Application, wallet):
-    """Check for new orders and positions for a wallet."""
-    try:
-        if wallet.orders_enabled:
-            orders = await predict_api.get_orders_by_maker(wallet.wallet_address)
-            for order in orders:
-                if not await is_order_seen(wallet.wallet_address, order.order_hash):
-                    await mark_order_seen(wallet.wallet_address, order.order_hash)
-                    message = format_order_message(order, wallet.name)
-                    try:
-                        await app.bot.send_message(
-                            chat_id=wallet.chat_id,
-                            text=message,
-                            parse_mode="Markdown",
-                            disable_web_page_preview=True
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to send order notification: {e}")
+def is_order_transaction(tx: Transaction) -> bool:
+    """Check if transaction is related to orders (CTF Exchange)."""
+    ctf_exchange = PREDICT_CONTRACTS["CTF_EXCHANGE"].lower()
+    neg_risk_exchange = PREDICT_CONTRACTS["NEG_RISK_CTF_EXCHANGE"].lower()
+    return tx.to_address.lower() in [ctf_exchange, neg_risk_exchange]
 
-        if wallet.positions_enabled:
-            positions = await predict_api.get_positions_by_maker(wallet.wallet_address)
-            for position in positions:
-                if not await is_position_seen(wallet.wallet_address, position.position_id):
-                    await mark_position_seen(wallet.wallet_address, position.position_id)
-                    message = format_position_message(position, wallet.name)
-                    try:
-                        await app.bot.send_message(
-                            chat_id=wallet.chat_id,
-                            text=message,
-                            parse_mode="Markdown",
-                            disable_web_page_preview=True
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to send position notification: {e}")
+
+def is_position_transaction(tx: Transaction) -> bool:
+    """Check if transaction is related to positions (Conditional Tokens)."""
+    conditional_tokens = PREDICT_CONTRACTS["CONDITIONAL_TOKENS"].lower()
+    return tx.to_address.lower() == conditional_tokens
+
+
+async def check_wallet_updates(app: Application, wallet):
+    """Check for new transactions for a wallet."""
+    try:
+        transactions = await bscscan_api.get_transactions(wallet.wallet_address)
+
+        for tx in transactions:
+            if tx.is_error:
+                continue
+
+            if await is_tx_seen(wallet.wallet_address, tx.tx_hash):
+                continue
+
+            await mark_tx_seen(wallet.wallet_address, tx.tx_hash)
+
+            # Check notification settings
+            should_notify = False
+            if wallet.orders_enabled and is_order_transaction(tx):
+                should_notify = True
+            if wallet.positions_enabled and is_position_transaction(tx):
+                should_notify = True
+
+            if should_notify:
+                message = format_transaction_message(tx, wallet.name)
+                try:
+                    await app.bot.send_message(
+                        chat_id=wallet.chat_id,
+                        text=message,
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send notification: {e}")
 
     except Exception as e:
         logger.error(f"Error checking updates for {wallet.wallet_address}: {e}")
@@ -403,7 +416,7 @@ async def post_shutdown(app: Application):
             await _tracking_task
         except asyncio.CancelledError:
             pass
-    await predict_api.close()
+    await bscscan_api.close()
     logger.info("Bot shutdown complete")
 
 
