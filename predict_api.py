@@ -70,6 +70,9 @@ class BscScanAPI:
 
     async def get_transactions(self, address: str, start_block: int = 0) -> list[Transaction]:
         """Get all transactions for a wallet address."""
+        all_transactions = []
+
+        # 1. Get regular transactions
         try:
             params = {
                 "module": "account",
@@ -79,23 +82,91 @@ class BscScanAPI:
                 "endblock": 99999999,
                 "sort": "desc",
                 "page": 1,
-                "offset": 100,
+                "offset": 50,
             }
             results = await self._request(params)
-            print(f"[DEBUG] Found {len(results) if isinstance(results, list) else 0} transactions for {address[:10]}...")
-            transactions = []
+            print(f"[DEBUG] Regular txs: {len(results) if isinstance(results, list) else 0} for {address[:10]}...")
             for item in results:
                 tx = self._parse_transaction(item)
-                if tx:
-                    to_lower = tx.to_address.lower()
-                    # Check if transaction interacts with Predict.fun contracts
-                    if to_lower in MONITORED_CONTRACTS:
-                        print(f"[DEBUG] Found Predict.fun tx: {tx.tx_hash[:16]}... to {tx.contract_name}")
-                        transactions.append(tx)
-            return transactions
+                if tx and tx.to_address.lower() in MONITORED_CONTRACTS:
+                    print(f"[DEBUG] Found Predict tx: {tx.tx_hash[:16]}... to {tx.contract_name}")
+                    all_transactions.append(tx)
         except Exception as e:
-            print(f"Error fetching transactions for {address}: {e}")
-            return []
+            print(f"Error fetching regular txs: {e}")
+
+        # 2. Get ERC-1155 NFT transfers (Conditional Tokens)
+        try:
+            params = {
+                "module": "account",
+                "action": "token1155tx",
+                "address": address,
+                "startblock": start_block,
+                "endblock": 99999999,
+                "sort": "desc",
+                "page": 1,
+                "offset": 50,
+            }
+            results = await self._request(params)
+            print(f"[DEBUG] ERC-1155 txs: {len(results) if isinstance(results, list) else 0} for {address[:10]}...")
+            for item in results:
+                contract_addr = item.get("contractAddress", "").lower()
+                if contract_addr == PREDICT_CONTRACTS["CONDITIONAL_TOKENS"].lower():
+                    tx = Transaction(
+                        tx_hash=item.get("hash", ""),
+                        block_number=item.get("blockNumber", ""),
+                        timestamp=item.get("timeStamp", ""),
+                        from_address=item.get("from", ""),
+                        to_address=item.get("to", ""),
+                        value=float(item.get("tokenValue", 0)),
+                        contract_address=contract_addr,
+                        method_id="",
+                        function_name="ERC1155 Transfer",
+                        is_error=False,
+                    )
+                    print(f"[DEBUG] Found ERC-1155 tx: {tx.tx_hash[:16]}...")
+                    all_transactions.append(tx)
+        except Exception as e:
+            print(f"Error fetching ERC-1155 txs: {e}")
+
+        # 3. Get ERC-20 token transfers (USDT)
+        try:
+            params = {
+                "module": "account",
+                "action": "tokentx",
+                "address": address,
+                "startblock": start_block,
+                "endblock": 99999999,
+                "sort": "desc",
+                "page": 1,
+                "offset": 50,
+            }
+            results = await self._request(params)
+            print(f"[DEBUG] ERC-20 txs: {len(results) if isinstance(results, list) else 0} for {address[:10]}...")
+            for item in results:
+                to_addr = item.get("to", "").lower()
+                from_addr = item.get("from", "").lower()
+                # Check if USDT transfer to/from Predict contracts
+                if to_addr in MONITORED_CONTRACTS or from_addr in MONITORED_CONTRACTS:
+                    decimals = int(item.get("tokenDecimal", 18))
+                    value = float(item.get("value", 0)) / (10 ** decimals)
+                    tx = Transaction(
+                        tx_hash=item.get("hash", ""),
+                        block_number=item.get("blockNumber", ""),
+                        timestamp=item.get("timeStamp", ""),
+                        from_address=from_addr,
+                        to_address=to_addr,
+                        value=value,
+                        contract_address=item.get("contractAddress", ""),
+                        method_id="",
+                        function_name=f"{item.get('tokenSymbol', 'Token')} Transfer",
+                        is_error=False,
+                    )
+                    print(f"[DEBUG] Found token tx: {tx.tx_hash[:16]}... {value} {item.get('tokenSymbol')}")
+                    all_transactions.append(tx)
+        except Exception as e:
+            print(f"Error fetching ERC-20 txs: {e}")
+
+        return all_transactions
 
     async def get_internal_transactions(self, address: str, start_block: int = 0) -> list[Transaction]:
         """Get internal transactions for a wallet address."""

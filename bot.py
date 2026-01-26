@@ -364,6 +364,9 @@ async def check_wallet_updates(app: Application, wallet):
                 should_notify = True
             if wallet.positions_enabled and is_position_transaction(tx):
                 should_notify = True
+            # Also notify for any Predict.fun related transaction
+            if wallet.orders_enabled or wallet.positions_enabled:
+                should_notify = True
 
             if should_notify:
                 logger.info(f"Sending notification for tx: {tx.tx_hash[:16]}...")
