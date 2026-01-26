@@ -82,11 +82,16 @@ class BscScanAPI:
                 "offset": 100,
             }
             results = await self._request(params)
+            print(f"[DEBUG] Found {len(results) if isinstance(results, list) else 0} transactions for {address[:10]}...")
             transactions = []
             for item in results:
                 tx = self._parse_transaction(item)
-                if tx and tx.to_address.lower() in MONITORED_CONTRACTS:
-                    transactions.append(tx)
+                if tx:
+                    to_lower = tx.to_address.lower()
+                    # Check if transaction interacts with Predict.fun contracts
+                    if to_lower in MONITORED_CONTRACTS:
+                        print(f"[DEBUG] Found Predict.fun tx: {tx.tx_hash[:16]}... to {tx.contract_name}")
+                        transactions.append(tx)
             return transactions
         except Exception as e:
             print(f"Error fetching transactions for {address}: {e}")

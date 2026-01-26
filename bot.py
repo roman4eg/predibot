@@ -345,7 +345,9 @@ def is_position_transaction(tx: Transaction) -> bool:
 async def check_wallet_updates(app: Application, wallet):
     """Check for new transactions for a wallet."""
     try:
+        # Get regular transactions
         transactions = await bscscan_api.get_transactions(wallet.wallet_address)
+        logger.info(f"Found {len(transactions)} Predict.fun transactions for {wallet.name}")
 
         for tx in transactions:
             if tx.is_error:
@@ -364,6 +366,7 @@ async def check_wallet_updates(app: Application, wallet):
                 should_notify = True
 
             if should_notify:
+                logger.info(f"Sending notification for tx: {tx.tx_hash[:16]}...")
                 message = format_transaction_message(tx, wallet.name)
                 try:
                     await app.bot.send_message(
@@ -386,7 +389,9 @@ async def tracking_loop(app: Application):
         while True:
             try:
                 wallets = await get_all_wallets()
+                logger.info(f"Checking {len(wallets)} wallets...")
                 for wallet in wallets:
+                    logger.info(f"Checking wallet: {wallet.name} ({wallet.wallet_address[:10]}...)")
                     await check_wallet_updates(app, wallet)
                     await asyncio.sleep(1)  # Small delay between wallets
             except asyncio.CancelledError:
