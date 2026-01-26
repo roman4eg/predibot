@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 
 WALLET_ADDRESS_PATTERN = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
+# Global tracking task reference
+_tracking_task: asyncio.Task | None = None
+
 
 def is_valid_address(address: str) -> bool:
     """Validate Ethereum/BNB wallet address format."""
@@ -366,22 +369,42 @@ async def check_wallet_updates(app: Application, wallet):
 async def tracking_loop(app: Application):
     """Main tracking loop that checks for updates periodically."""
     logger.info("Starting tracking loop...")
-    while True:
-        try:
-            wallets = await get_all_wallets()
-            for wallet in wallets:
-                await check_wallet_updates(app, wallet)
-                await asyncio.sleep(1)  # Small delay between wallets
-        except Exception as e:
-            logger.error(f"Error in tracking loop: {e}")
+    try:
+        while True:
+            try:
+                wallets = await get_all_wallets()
+                for wallet in wallets:
+                    await check_wallet_updates(app, wallet)
+                    await asyncio.sleep(1)  # Small delay between wallets
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Error in tracking loop: {e}")
 
-        await asyncio.sleep(POLLING_INTERVAL)
+            await asyncio.sleep(POLLING_INTERVAL)
+    except asyncio.CancelledError:
+        logger.info("Tracking loop cancelled")
+        raise
 
 
 async def post_init(app: Application):
     """Initialize database and start tracking loop after bot starts."""
+    global _tracking_task
     await init_db()
-    asyncio.create_task(tracking_loop(app))
+    _tracking_task = asyncio.create_task(tracking_loop(app))
+
+
+async def post_shutdown(app: Application):
+    """Cleanup on bot shutdown."""
+    global _tracking_task
+    if _tracking_task and not _tracking_task.done():
+        _tracking_task.cancel()
+        try:
+            await _tracking_task
+        except asyncio.CancelledError:
+            pass
+    await predict_api.close()
+    logger.info("Bot shutdown complete")
 
 
 def main():
@@ -391,7 +414,13 @@ def main():
         print("Please create a .env file based on .env.example")
         return
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
