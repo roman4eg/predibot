@@ -58,11 +58,13 @@ class BscScanAPI:
         async with session.get(self.api_url, params=params) as response:
             if response.status == 200:
                 data = await response.json()
+                print(f"[DEBUG API] status={data.get('status')} message={data.get('message')}")
                 if data.get("status") == "1":
                     return data.get("result", [])
                 elif data.get("message") == "No transactions found":
                     return []
                 else:
+                    print(f"[DEBUG API] Full response: {data}")
                     return []
             else:
                 text = await response.text()
