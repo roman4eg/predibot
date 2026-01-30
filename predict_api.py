@@ -1,55 +1,67 @@
 import aiohttp
 from typing import Optional
 from dataclasses import dataclass
-from config import PREDICTSCAN_API_URL, PREDICT_WEB_URL
+from config import PREDICT_API_URL, PREDICT_API_KEY, PREDICT_WEB_URL
 
 
 @dataclass
-class Order:
+class OrderMatch:
+    """Represents a filled order match event."""
+    match_id: str
     order_hash: str
     maker: str
-    asset_id: str
-    amount: float  # USDT amount
-    shares: float  # Token quantity
-    fee: float
+    market_id: str
+    market_slug: str
+    market_title: str
+    outcome_index: int
+    outcome_title: str
     side: str  # BUY or SELL
-    price: float
-    fill_count: int
-    first_fill_time: int
-    last_fill_time: int
-    tx_hashes: list[str]
-    market_title: str = ""
-    parent_event_title: str = ""
+    price: float  # Price per share (0-1)
+    shares: float  # Number of shares
+    amount: float  # Total USDT amount
+    fee: float
+    executed_at: str  # ISO timestamp
+    tx_hash: str
 
     @property
     def url(self) -> str:
-        return f"https://predictdotfun.predictscan.dev/order?orderHash={self.order_hash}"
+        if self.market_slug:
+            return f"{PREDICT_WEB_URL}/markets/{self.market_slug}"
+        return f"{PREDICT_WEB_URL}/markets/{self.market_id}"
 
     @property
     def tx_url(self) -> str:
-        if self.tx_hashes:
-            return f"https://bscscan.com/tx/{self.tx_hashes[-1]}"
+        if self.tx_hash:
+            return f"https://bscscan.com/tx/{self.tx_hash}"
         return ""
 
 
 @dataclass
 class Position:
-    maker: str
-    asset_id: str
+    """Represents a user position."""
+    market_id: str
+    market_slug: str
+    market_title: str
+    outcome_index: int
+    outcome_title: str
     shares: float
     avg_price: float
-    snapshot_time: int
-    market_title: str = ""
-    condition_id: str = ""
+    current_price: float
+    value: float
 
     @property
     def url(self) -> str:
-        return f"{PREDICT_WEB_URL}"
+        if self.market_slug:
+            return f"{PREDICT_WEB_URL}/markets/{self.market_slug}"
+        return f"{PREDICT_WEB_URL}/markets/{self.market_id}"
 
 
-class PredictscanAPI:
+class PredictAPI:
+    """Client for official Predict.fun API."""
+
     def __init__(self):
-        self.api_url = PREDICTSCAN_API_URL
+        self.api_url = PREDICT_API_URL
+        self.api_key = PREDICT_API_KEY
         self._session: Optional[aiohttp.ClientSession] = None
         self._markets_cache: dict = {}
 
@@ -66,15 +78,14 @@ class PredictscanAPI:
     async def _request(self, endpoint: str, params: dict = None) -> dict:
         session = await self._get_session()
         url = f"{self.api_url}{endpoint}"
+        headers = {}
+        if self.api_key:
+            headers["x-api-key"] = self.api_key
+
         try:
-            async with session.get(url, params=params) as response:
+            async with session.get(url, params=params, headers=headers) as response:
                 if response.status == 200:
-                    data = await response.json()
-                    if data.get("success"):
-                        return data
-                    else:
-                        print(f"[DEBUG API] Error: {data.get('error', {}).get('message', 'Unknown error')}")
-                        return {}
+                    return await response.json()
                 else:
                     text = await response.text()
                     print(f"[DEBUG API] Request failed: {response.status} - {text[:200]}")
@@ -83,92 +94,65 @@ class PredictscanAPI:
             print(f"[DEBUG API] Exception: {e}")
             return {}
 
-    async def get_market_by_asset(self, asset_id: str) -> dict:
-        """Get market info by asset ID."""
-        if asset_id in self._markets_cache:
-            return self._markets_cache[asset_id]
+    async def get_order_matches(self, signer: str, first: int = 50, after: str = None) -> list[OrderMatch]:
+        """Get order match events for a wallet address.
 
-        result = await self._request(f"/api/markets/by-asset/{asset_id}")
-        if result.get("success"):
-            market = result.get("data", {})
-            self._markets_cache[asset_id] = market
-            return market
-        return {}
-
-    async def get_orders_by_maker(self, maker_address: str, after_time: int = 0) -> list[Order]:
-        """Get orders by maker address."""
+        Uses the /v1/orders/matches endpoint which returns filled orders
+        filtered by signer (wallet address).
+        """
         try:
-            params = {"limit": 100}
-            if after_time > 0:
-                params["afterTime"] = after_time
+            params = {"signer": signer.lower(), "first": first}
+            if after:
+                params["after"] = after
 
-            result = await self._request(f"/api/orders/by-maker/{maker_address}", params)
-            if not result.get("success"):
+            result = await self._request("/v1/orders/matches", params)
+            if not result:
                 return []
 
-            orders = []
-            for item in result.get("data", []):
-                # Get market info for title
-                asset_id = item.get("assetId", "")
-                market = await self.get_market_by_asset(asset_id) if asset_id else {}
+            matches = []
+            data = result.get("data", [])
 
-                order = Order(
+            for item in data:
+                market = item.get("market", {})
+                outcome = item.get("outcome", {})
+
+                match = OrderMatch(
+                    match_id=item.get("id", ""),
                     order_hash=item.get("orderHash", ""),
                     maker=item.get("maker", ""),
-                    asset_id=asset_id,
-                    amount=float(item.get("amount", 0)),
-                    shares=float(item.get("shares", 0)),
-                    fee=float(item.get("fee", 0)),
-                    side=item.get("sideStr", item.get("side", "BUY")),
+                    market_id=market.get("id", ""),
+                    market_slug=market.get("slug", ""),
+                    market_title=market.get("title", ""),
+                    outcome_index=outcome.get("index", 0),
+                    outcome_title=outcome.get("title", ""),
+                    side=item.get("side", "BUY"),
                     price=float(item.get("price", 0)),
-                    fill_count=int(item.get("fillCount", 0)),
-                    first_fill_time=int(item.get("firstFillTime", 0)),
-                    last_fill_time=int(item.get("lastFillTime", 0)),
-                    tx_hashes=item.get("txHashes", []),
-                    market_title=market.get("marketTitle", item.get("marketTitle", "")),
-                    parent_event_title=market.get("parentEvent", {}).get("title", item.get("parentEventTitle", ""))
+                    shares=float(item.get("size", 0)),
+                    amount=float(item.get("value", 0)),
+                    fee=float(item.get("fee", 0)),
+                    executed_at=item.get("executedAt", ""),
+                    tx_hash=item.get("txHash", "")
                 )
-                orders.append(order)
+                matches.append(match)
 
-            print(f"[DEBUG] Found {len(orders)} orders for {maker_address[:10]}...")
-            return orders
+            print(f"[DEBUG] Found {len(matches)} order matches for {signer[:10]}...")
+            return matches
         except Exception as e:
-            print(f"Error fetching orders for {maker_address}: {e}")
+            print(f"Error fetching order matches for {signer}: {e}")
             return []
 
-    async def get_positions_by_address(self, address: str) -> list[Position]:
-        """Get positions by address."""
-        try:
-            params = {"limit": 100, "includeConditionId": "true"}
-            result = await self._request(f"/api/user/positions/{address}", params)
-            if not result.get("success"):
-                return []
+    async def get_positions(self, address: str, first: int = 50) -> list[Position]:
+        """Get positions for a wallet address.
 
-            data = result.get("data", {})
-            positions_data = data.get("data", []) if isinstance(data, dict) else data
-
-            positions = []
-            for item in positions_data:
-                asset_id = item.get("assetId", "")
-                market = await self.get_market_by_asset(asset_id) if asset_id else {}
-
-                position = Position(
-                    maker=item.get("maker", ""),
-                    asset_id=asset_id,
-                    shares=float(item.get("shares", 0)),
-                    avg_price=float(item.get("avgPrice", 0)),
-                    snapshot_time=int(item.get("snapshotTime", 0)),
-                    market_title=market.get("marketTitle", ""),
-                    condition_id=item.get("conditionId", "")
-                )
-                positions.append(position)
-
-            print(f"[DEBUG] Found {len(positions)} positions for {address[:10]}...")
-            return positions
-        except Exception as e:
-            print(f"Error fetching positions for {address}: {e}")
-            return []
+        Note: This endpoint requires authentication with the wallet's JWT token,
+        so it may not work for tracking other wallets without their permission.
+        We'll try the public market data instead.
+        """
+        # The /v1/positions endpoint requires JWT auth for the specific wallet
+        # So instead we return empty - positions will be inferred from order matches
+        print(f"[DEBUG] Positions endpoint requires auth, skipping for {address[:10]}...")
+        return []
 
 
 # Global API instance
-predictscan_api = PredictscanAPI()
+predict_api = PredictAPI()

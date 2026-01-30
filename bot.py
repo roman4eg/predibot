@@ -21,13 +21,9 @@ from database import (
     toggle_positions,
     is_order_seen,
     mark_order_seen,
-    is_position_seen,
-    mark_position_seen,
     get_wallet_by_address,
-    get_last_check_time,
-    update_last_check_time,
 )
-from predict_api import predictscan_api, Order, Position
+from predict_api import predict_api, OrderMatch
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -46,19 +42,17 @@ def is_valid_address(address: str) -> bool:
     return bool(WALLET_ADDRESS_PATTERN.match(address))
 
 
-def format_order_message(order: Order, wallet_name: str) -> str:
+def format_order_message(order: OrderMatch, wallet_name: str) -> str:
     """Format order notification message."""
-    timestamp = datetime.fromtimestamp(order.last_fill_time).strftime("%Y-%m-%d %H:%M:%S") if order.last_fill_time else ""
+    timestamp = order.executed_at[:19].replace("T", " ") if order.executed_at else ""
 
     # Build market title
     market_display = order.market_title or "Unknown Market"
-    if order.parent_event_title:
-        market_display = f"{order.parent_event_title} - {order.market_title}"
+    if order.outcome_title:
+        market_display = f"{market_display} - {order.outcome_title}"
 
-    # Price display (0-100 format from API, convert to 0-1)
+    # Price is already 0-1 from the API
     price_display = order.price
-    if price_display > 1:
-        price_display = price_display / 100
 
     return (
         f"**New Order** | {wallet_name}\n\n"
@@ -69,31 +63,7 @@ def format_order_message(order: Order, wallet_name: str) -> str:
         f"**Amount:** ${order.amount:.2f}\n"
         f"**Fee:** ${order.fee:.4f}\n"
         f"**Time:** {timestamp}\n\n"
-        f"[View Order]({order.url})"
-    )
-
-
-def format_position_message(position: Position, wallet_name: str) -> str:
-    """Format position notification message."""
-    timestamp = datetime.fromtimestamp(position.snapshot_time).strftime("%Y-%m-%d %H:%M:%S") if position.snapshot_time else ""
-
-    market_display = position.market_title or "Unknown Market"
-
-    # Price display
-    price_display = position.avg_price
-    if price_display > 1:
-        price_display = price_display / 100
-
-    total_value = position.shares * price_display
-
-    return (
-        f"**New Position** | {wallet_name}\n\n"
-        f"**Market:** {market_display}\n"
-        f"**Shares:** {position.shares:.2f}\n"
-        f"**Avg Price:** ${price_display:.4f}\n"
-        f"**Value:** ${total_value:.2f}\n"
-        f"**Time:** {timestamp}\n\n"
-        f"[View on Predict.fun]({PREDICT_WEB_URL})"
+        f"[View Market]({order.url}) | [View TX]({order.tx_url})"
     )
 
 
@@ -351,26 +321,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check_wallet_updates(app: Application, wallet):
-    """Check for new orders and positions for a wallet."""
+    """Check for new orders for a wallet."""
     try:
-        # Get last check time for this wallet
-        last_check = await get_last_check_time(wallet.wallet_address)
-
-        # Check orders
+        # Check orders (positions not available via public API)
         if wallet.orders_enabled:
-            orders = await predictscan_api.get_orders_by_maker(wallet.wallet_address, after_time=last_check)
-            logger.info(f"Found {len(orders)} orders for {wallet.name}")
+            orders = await predict_api.get_order_matches(wallet.wallet_address)
+            logger.info(f"Found {len(orders)} order matches for {wallet.name}")
 
             for order in orders:
-                if not order.order_hash:
+                # Use match_id as unique identifier
+                order_id = order.match_id or order.order_hash
+                if not order_id:
                     continue
 
-                if await is_order_seen(wallet.wallet_address, order.order_hash):
+                if await is_order_seen(wallet.wallet_address, order_id):
                     continue
 
-                await mark_order_seen(wallet.wallet_address, order.order_hash)
+                await mark_order_seen(wallet.wallet_address, order_id)
 
-                logger.info(f"Sending order notification: {order.order_hash[:16]}...")
+                logger.info(f"Sending order notification: {order_id[:16]}...")
                 message = format_order_message(order, wallet.name)
                 try:
                     await app.bot.send_message(
@@ -381,34 +350,6 @@ async def check_wallet_updates(app: Application, wallet):
                     )
                 except Exception as e:
                     logger.error(f"Failed to send order notification: {e}")
-
-        # Check positions
-        if wallet.positions_enabled:
-            positions = await predictscan_api.get_positions_by_address(wallet.wallet_address)
-            logger.info(f"Found {len(positions)} positions for {wallet.name}")
-
-            for position in positions:
-                position_id = f"{position.asset_id}:{position.snapshot_time}"
-
-                if await is_position_seen(wallet.wallet_address, position_id):
-                    continue
-
-                await mark_position_seen(wallet.wallet_address, position_id)
-
-                logger.info(f"Sending position notification: {position.asset_id[:16]}...")
-                message = format_position_message(position, wallet.name)
-                try:
-                    await app.bot.send_message(
-                        chat_id=wallet.chat_id,
-                        text=message,
-                        parse_mode="Markdown",
-                        disable_web_page_preview=True
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to send position notification: {e}")
-
-        # Update last check time
-        await update_last_check_time(wallet.wallet_address)
 
     except Exception as e:
         logger.error(f"Error checking updates for {wallet.wallet_address}: {e}")
@@ -453,7 +394,7 @@ async def post_shutdown(app: Application):
             await _tracking_task
         except asyncio.CancelledError:
             pass
-    await predictscan_api.close()
+    await predict_api.close()
     logger.info("Bot shutdown complete")
 
 

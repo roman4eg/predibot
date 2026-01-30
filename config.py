@@ -7,6 +7,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 POLLING_INTERVAL = int(os.getenv("POLLING_INTERVAL", "10"))
 
 PREDICT_WEB_URL = "https://predict.fun"
-# Try HTTPS version of Predictscan API
-PREDICTSCAN_API_URL = os.getenv("PREDICTSCAN_API_URL", "https://predictdotfun.predictscan.dev")
-PREDICTSCAN_WS_URL = "wss://predictdotfun.predictscan.dev/ws"
+# Official Predict.fun API
+PREDICT_API_URL = os.getenv("PREDICT_API_URL", "https://api.predict.fun")
+PREDICT_API_KEY = os.getenv("PREDICT_API_KEY", "")
