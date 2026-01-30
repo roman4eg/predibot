@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import re
-from datetime import datetime
+import html
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -42,28 +42,41 @@ def is_valid_address(address: str) -> bool:
     return bool(WALLET_ADDRESS_PATTERN.match(address))
 
 
+def escape_html(text: str) -> str:
+    """Escape HTML special characters."""
+    return html.escape(str(text))
+
+
 def format_order_message(order: OrderMatch, wallet_name: str) -> str:
     """Format order notification message."""
     timestamp = order.executed_at[:19].replace("T", " ") if order.executed_at else ""
 
-    # Build market title
-    market_display = order.market_title or "Unknown Market"
+    # Build market title (escaped for HTML)
+    market_display = escape_html(order.market_title or "Unknown Market")
     if order.outcome_title:
-        market_display = f"{market_display} - {order.outcome_title}"
+        market_display = f"{market_display} - {escape_html(order.outcome_title)}"
 
     # Price is already 0-1 from the API
     price_display = order.price
 
+    # Build links
+    links = []
+    if order.url:
+        links.append(f'<a href="{order.url}">View Market</a>')
+    if order.tx_url:
+        links.append(f'<a href="{order.tx_url}">View TX</a>')
+    links_text = " | ".join(links) if links else ""
+
     return (
-        f"**New Order** | {wallet_name}\n\n"
-        f"**Market:** {market_display}\n"
-        f"**Side:** {order.side}\n"
-        f"**Price:** ${price_display:.4f}\n"
-        f"**Shares:** {order.shares:.2f}\n"
-        f"**Amount:** ${order.amount:.2f}\n"
-        f"**Fee:** ${order.fee:.4f}\n"
-        f"**Time:** {timestamp}\n\n"
-        f"[View Market]({order.url}) | [View TX]({order.tx_url})"
+        f"<b>New Order</b> | {escape_html(wallet_name)}\n\n"
+        f"<b>Market:</b> {market_display}\n"
+        f"<b>Side:</b> {order.side}\n"
+        f"<b>Price:</b> ${price_display:.4f}\n"
+        f"<b>Shares:</b> {order.shares:.2f}\n"
+        f"<b>Amount:</b> ${order.amount:.2f}\n"
+        f"<b>Fee:</b> ${order.fee:.4f}\n"
+        f"<b>Time:</b> {timestamp}\n\n"
+        f"{links_text}"
     )
 
 
@@ -72,15 +85,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Welcome to Predict.fun Wallet Tracker Bot!\n\n"
         "Track wallet activity on Predict.fun prediction market.\n\n"
-        "**Commands:**\n"
-        "/add <address> <name> - Add wallet to track\n"
-        "/remove <address> - Remove wallet from tracking\n"
+        "<b>Commands:</b>\n"
+        "/add &lt;address&gt; &lt;name&gt; - Add wallet to track\n"
+        "/remove &lt;address&gt; - Remove wallet from tracking\n"
         "/list - List all tracked wallets\n"
         "/settings - Manage notification settings\n"
         "/help - Show this help message\n\n"
         "Example:\n"
-        "`/add 0x1234...abcd MyWallet`",
-        parse_mode="Markdown"
+        "<code>/add 0x1234...abcd MyWallet</code>",
+        parse_mode="HTML"
     )
 
 
@@ -93,9 +106,9 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /add command to add a wallet for tracking."""
     if len(context.args) < 2:
         await update.message.reply_text(
-            "Usage: /add <wallet_address> <name>\n"
-            "Example: `/add 0x1234...abcd MyWallet`",
-            parse_mode="Markdown"
+            "Usage: /add &lt;wallet_address&gt; &lt;name&gt;\n"
+            "Example: <code>/add 0x1234...abcd MyWallet</code>",
+            parse_mode="HTML"
         )
         return
 
@@ -113,9 +126,9 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if success:
         await update.message.reply_text(
-            f"Wallet **{name}** (`{address[:8]}...{address[-6:]}`) added successfully!\n\n"
-            f"You will receive notifications for new orders and positions.",
-            parse_mode="Markdown"
+            f"Wallet <b>{escape_html(name)}</b> (<code>{address[:8]}...{address[-6:]}</code>) added successfully!\n\n"
+            f"You will receive notifications for new orders.",
+            parse_mode="HTML"
         )
     else:
         await update.message.reply_text(
@@ -127,9 +140,9 @@ async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /remove command to remove a wallet from tracking."""
     if len(context.args) < 1:
         await update.message.reply_text(
-            "Usage: /remove <wallet_address>\n"
-            "Example: `/remove 0x1234...abcd`",
-            parse_mode="Markdown"
+            "Usage: /remove &lt;wallet_address&gt;\n"
+            "Example: <code>/remove 0x1234...abcd</code>",
+            parse_mode="HTML"
         )
         return
 
@@ -139,8 +152,8 @@ async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if success:
         await update.message.reply_text(
-            f"Wallet `{address[:8]}...{address[-6:]}` removed from tracking.",
-            parse_mode="Markdown"
+            f"Wallet <code>{address[:8]}...{address[-6:]}</code> removed from tracking.",
+            parse_mode="HTML"
         )
     else:
         await update.message.reply_text(
@@ -156,21 +169,22 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not wallets:
         await update.message.reply_text(
             "You are not tracking any wallets.\n"
-            "Use /add <address> <name> to add one."
+            "Use /add &lt;address&gt; &lt;name&gt; to add one.",
+            parse_mode="HTML"
         )
         return
 
-    message = "**Tracked Wallets:**\n\n"
+    message = "<b>Tracked Wallets:</b>\n\n"
     for w in wallets:
         orders_status = "ON" if w.orders_enabled else "OFF"
         positions_status = "ON" if w.positions_enabled else "OFF"
         message += (
-            f"**{w.name}**\n"
-            f"`{w.wallet_address[:8]}...{w.wallet_address[-6:]}`\n"
+            f"<b>{escape_html(w.name)}</b>\n"
+            f"<code>{w.wallet_address[:8]}...{w.wallet_address[-6:]}</code>\n"
             f"Orders: {orders_status} | Positions: {positions_status}\n\n"
         )
 
-    await update.message.reply_text(message, parse_mode="Markdown")
+    await update.message.reply_text(message, parse_mode="HTML")
 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -182,11 +196,12 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not wallets:
             await update.message.reply_text(
                 "You are not tracking any wallets.\n"
-                "Use /add <address> <name> to add one."
+                "Use /add &lt;address&gt; &lt;name&gt; to add one.",
+                parse_mode="HTML"
             )
             return
 
-        message = "**Select wallet to configure:**\n\n"
+        message = "<b>Select wallet to configure:</b>\n\n"
         keyboard = []
         for w in wallets:
             keyboard.append([
@@ -198,7 +213,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             message,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
@@ -234,10 +249,10 @@ async def send_settings_menu(message, wallet):
     ]
 
     await message.reply_text(
-        f"**Settings for {wallet.name}**\n"
-        f"`{wallet.wallet_address[:8]}...{wallet.wallet_address[-6:]}`\n\n"
+        f"<b>Settings for {escape_html(wallet.name)}</b>\n"
+        f"<code>{wallet.wallet_address[:8]}...{wallet.wallet_address[-6:]}</code>\n\n"
         f"Tap buttons below to toggle notifications:",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -345,7 +360,7 @@ async def check_wallet_updates(app: Application, wallet):
                     await app.bot.send_message(
                         chat_id=wallet.chat_id,
                         text=message,
-                        parse_mode="Markdown",
+                        parse_mode="HTML",
                         disable_web_page_preview=True
                     )
                 except Exception as e:
