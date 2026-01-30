@@ -2,9 +2,7 @@ import aiohttp
 from typing import Optional
 from dataclasses import dataclass
 from config import (
-    BSCSCAN_API_URL,
-    BSCSCAN_API_KEY,
-    BSC_CHAIN_ID,
+    ANKR_API_URL,
     PREDICT_WEB_URL,
     PREDICT_CONTRACTS,
     MONITORED_CONTRACTS,
@@ -37,11 +35,11 @@ class Transaction:
         return "Unknown Contract"
 
 
-class BscScanAPI:
+class AnkrAPI:
     def __init__(self):
-        self.api_url = BSCSCAN_API_URL
-        self.api_key = BSCSCAN_API_KEY
+        self.api_url = ANKR_API_URL
         self._session: Optional[aiohttp.ClientSession] = None
+        self._request_id = 0
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -52,210 +50,127 @@ class BscScanAPI:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def _request(self, params: dict) -> dict:
+    async def _rpc_request(self, method: str, params: dict) -> dict:
         session = await self._get_session()
-        # Add chainid for Etherscan V2 API
-        params["chainid"] = BSC_CHAIN_ID
-        if self.api_key:
-            params["apikey"] = self.api_key
-        async with session.get(self.api_url, params=params) as response:
+        self._request_id += 1
+
+        payload = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": self._request_id
+        }
+
+        async with session.post(self.api_url, json=payload) as response:
             if response.status == 200:
                 data = await response.json()
-                print(f"[DEBUG API] status={data.get('status')} message={data.get('message')}")
-                if data.get("status") == "1":
-                    return data.get("result", [])
-                elif data.get("message") == "No transactions found":
-                    return []
-                else:
-                    print(f"[DEBUG API] Full response: {data}")
-                    return []
+                if "error" in data:
+                    print(f"[DEBUG API] Error: {data['error']}")
+                    return {}
+                return data.get("result", {})
             else:
                 text = await response.text()
-                raise Exception(f"BscScan API request failed: {response.status} - {text}")
+                print(f"[DEBUG API] Request failed: {response.status} - {text}")
+                return {}
 
-    async def get_transactions(self, address: str, start_block: int = 0) -> list[Transaction]:
-        """Get all transactions for a wallet address."""
+    async def get_transactions(self, address: str) -> list[Transaction]:
+        """Get all transactions for a wallet address using ANKR API."""
         all_transactions = []
 
-        # 1. Get regular transactions
+        # 1. Get transactions by address
         try:
             params = {
-                "module": "account",
-                "action": "txlist",
                 "address": address,
-                "startblock": start_block,
-                "endblock": 99999999,
-                "sort": "desc",
-                "page": 1,
-                "offset": 50,
+                "blockchain": ["bsc"],
+                "pageSize": 50,
+                "descOrder": True,
             }
-            results = await self._request(params)
-            print(f"[DEBUG] Regular txs: {len(results) if isinstance(results, list) else 0} for {address[:10]}...")
-            for item in results:
+            result = await self._rpc_request("ankr_getTransactionsByAddress", params)
+            txs = result.get("transactions", [])
+            print(f"[DEBUG] Regular txs: {len(txs)} for {address[:10]}...")
+
+            for item in txs:
                 tx = self._parse_transaction(item)
-                if tx and tx.to_address.lower() in MONITORED_CONTRACTS:
-                    print(f"[DEBUG] Found Predict tx: {tx.tx_hash[:16]}... to {tx.contract_name}")
-                    all_transactions.append(tx)
+                if tx:
+                    to_lower = tx.to_address.lower() if tx.to_address else ""
+                    if to_lower in MONITORED_CONTRACTS:
+                        print(f"[DEBUG] Found Predict tx: {tx.tx_hash[:16]}... to {tx.contract_name}")
+                        all_transactions.append(tx)
         except Exception as e:
-            print(f"Error fetching regular txs: {e}")
+            print(f"Error fetching transactions: {e}")
 
-        # 2. Get ERC-1155 NFT transfers (Conditional Tokens)
+        # 2. Get token transfers
         try:
             params = {
-                "module": "account",
-                "action": "token1155tx",
-                "address": address,
-                "startblock": start_block,
-                "endblock": 99999999,
-                "sort": "desc",
-                "page": 1,
-                "offset": 50,
+                "address": [address],
+                "blockchain": ["bsc"],
+                "pageSize": 50,
+                "descOrder": True,
             }
-            results = await self._request(params)
-            print(f"[DEBUG] ERC-1155 txs: {len(results) if isinstance(results, list) else 0} for {address[:10]}...")
-            for item in results:
+            result = await self._rpc_request("ankr_getTokenTransfers", params)
+            transfers = result.get("transfers", [])
+            print(f"[DEBUG] Token transfers: {len(transfers)} for {address[:10]}...")
+
+            for item in transfers:
+                to_addr = item.get("toAddress", "").lower()
+                from_addr = item.get("fromAddress", "").lower()
                 contract_addr = item.get("contractAddress", "").lower()
-                if contract_addr == PREDICT_CONTRACTS["CONDITIONAL_TOKENS"].lower():
-                    tx = Transaction(
-                        tx_hash=item.get("hash", ""),
-                        block_number=item.get("blockNumber", ""),
-                        timestamp=item.get("timeStamp", ""),
-                        from_address=item.get("from", ""),
-                        to_address=item.get("to", ""),
-                        value=float(item.get("tokenValue", 0)),
-                        contract_address=contract_addr,
-                        method_id="",
-                        function_name="ERC1155 Transfer",
-                        is_error=False,
-                    )
-                    print(f"[DEBUG] Found ERC-1155 tx: {tx.tx_hash[:16]}...")
-                    all_transactions.append(tx)
-        except Exception as e:
-            print(f"Error fetching ERC-1155 txs: {e}")
 
-        # 3. Get ERC-20 token transfers (USDT)
-        try:
-            params = {
-                "module": "account",
-                "action": "tokentx",
-                "address": address,
-                "startblock": start_block,
-                "endblock": 99999999,
-                "sort": "desc",
-                "page": 1,
-                "offset": 50,
-            }
-            results = await self._request(params)
-            print(f"[DEBUG] ERC-20 txs: {len(results) if isinstance(results, list) else 0} for {address[:10]}...")
-            for item in results:
-                to_addr = item.get("to", "").lower()
-                from_addr = item.get("from", "").lower()
-                # Check if USDT transfer to/from Predict contracts
-                if to_addr in MONITORED_CONTRACTS or from_addr in MONITORED_CONTRACTS:
-                    decimals = int(item.get("tokenDecimal", 18))
-                    value = float(item.get("value", 0)) / (10 ** decimals)
+                # Check if transfer involves Predict.fun contracts
+                if to_addr in MONITORED_CONTRACTS or from_addr in MONITORED_CONTRACTS or contract_addr in MONITORED_CONTRACTS:
+                    value = float(item.get("value", "0"))
+                    decimals = int(item.get("tokenDecimals", 18))
+                    value = value / (10 ** decimals) if decimals > 0 else value
+
                     tx = Transaction(
-                        tx_hash=item.get("hash", ""),
-                        block_number=item.get("blockNumber", ""),
-                        timestamp=item.get("timeStamp", ""),
+                        tx_hash=item.get("transactionHash", ""),
+                        block_number=str(item.get("blockNumber", "")),
+                        timestamp=item.get("timestamp", ""),
                         from_address=from_addr,
                         to_address=to_addr,
                         value=value,
-                        contract_address=item.get("contractAddress", ""),
+                        contract_address=contract_addr,
                         method_id="",
                         function_name=f"{item.get('tokenSymbol', 'Token')} Transfer",
                         is_error=False,
                     )
-                    print(f"[DEBUG] Found token tx: {tx.tx_hash[:16]}... {value} {item.get('tokenSymbol')}")
+                    print(f"[DEBUG] Found token transfer: {tx.tx_hash[:16]}... {value} {item.get('tokenSymbol')}")
                     all_transactions.append(tx)
         except Exception as e:
-            print(f"Error fetching ERC-20 txs: {e}")
+            print(f"Error fetching token transfers: {e}")
 
         return all_transactions
 
-    async def get_internal_transactions(self, address: str, start_block: int = 0) -> list[Transaction]:
-        """Get internal transactions for a wallet address."""
-        try:
-            params = {
-                "module": "account",
-                "action": "txlistinternal",
-                "address": address,
-                "startblock": start_block,
-                "endblock": 99999999,
-                "sort": "desc",
-                "page": 1,
-                "offset": 100,
-            }
-            results = await self._request(params)
-            transactions = []
-            for item in results:
-                tx = self._parse_transaction(item)
-                if tx:
-                    transactions.append(tx)
-            return transactions
-        except Exception as e:
-            print(f"Error fetching internal transactions for {address}: {e}")
-            return []
-
-    async def get_token_transfers(self, address: str, start_block: int = 0) -> list[dict]:
-        """Get ERC20 token transfers for a wallet address."""
-        try:
-            params = {
-                "module": "account",
-                "action": "tokentx",
-                "address": address,
-                "startblock": start_block,
-                "endblock": 99999999,
-                "sort": "desc",
-                "page": 1,
-                "offset": 100,
-            }
-            results = await self._request(params)
-            transfers = []
-            for item in results:
-                # Filter for USDT transfers to/from Predict contracts
-                contract_addr = item.get("contractAddress", "").lower()
-                to_addr = item.get("to", "").lower()
-                from_addr = item.get("from", "").lower()
-
-                if contract_addr == PREDICT_CONTRACTS["USDT"].lower():
-                    if to_addr in MONITORED_CONTRACTS or from_addr in MONITORED_CONTRACTS:
-                        transfers.append({
-                            "tx_hash": item.get("hash", ""),
-                            "block_number": item.get("blockNumber", ""),
-                            "timestamp": item.get("timeStamp", ""),
-                            "from": item.get("from", ""),
-                            "to": item.get("to", ""),
-                            "value": float(item.get("value", 0)) / 1e18,
-                            "token_symbol": item.get("tokenSymbol", ""),
-                            "token_decimal": item.get("tokenDecimal", "18"),
-                        })
-            return transfers
-        except Exception as e:
-            print(f"Error fetching token transfers for {address}: {e}")
-            return []
-
     def _parse_transaction(self, item: dict) -> Optional[Transaction]:
-        """Parse transaction data from BscScan API response."""
+        """Parse transaction data from ANKR API response."""
         try:
-            value_wei = int(item.get("value", 0))
+            value_str = item.get("value", "0")
+            # Handle hex values
+            if isinstance(value_str, str) and value_str.startswith("0x"):
+                value_wei = int(value_str, 16)
+            else:
+                value_wei = int(value_str) if value_str else 0
             value_bnb = value_wei / 1e18
 
             input_data = item.get("input", "")
             method_id = input_data[:10] if len(input_data) >= 10 else ""
-            function_name = item.get("functionName", "").split("(")[0] if item.get("functionName") else ""
+
+            # Get method name from input or use default
+            method_name = item.get("method", "")
+            if not method_name and method_id:
+                method_name = method_id
 
             return Transaction(
-                tx_hash=item.get("hash", ""),
-                block_number=item.get("blockNumber", ""),
-                timestamp=item.get("timeStamp", ""),
-                from_address=item.get("from", ""),
-                to_address=item.get("to", ""),
+                tx_hash=item.get("hash", item.get("transactionHash", "")),
+                block_number=str(item.get("blockNumber", "")),
+                timestamp=str(item.get("timestamp", "")),
+                from_address=item.get("from", item.get("fromAddress", "")),
+                to_address=item.get("to", item.get("toAddress", "")),
                 value=value_bnb,
                 contract_address=item.get("contractAddress", ""),
                 method_id=method_id,
-                function_name=function_name,
-                is_error=item.get("isError", "0") == "1",
+                function_name=method_name,
+                is_error=item.get("status") == "0" if "status" in item else False,
             )
         except Exception as e:
             print(f"Error parsing transaction: {e}")
@@ -263,4 +178,4 @@ class BscScanAPI:
 
 
 # Global API instance
-bscscan_api = BscScanAPI()
+ankr_api = AnkrAPI()

@@ -23,7 +23,7 @@ from database import (
     mark_tx_seen,
     get_wallet_by_address,
 )
-from predict_api import bscscan_api, Transaction
+from predict_api import ankr_api, Transaction
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -346,7 +346,7 @@ async def check_wallet_updates(app: Application, wallet):
     """Check for new transactions for a wallet."""
     try:
         # Get regular transactions
-        transactions = await bscscan_api.get_transactions(wallet.wallet_address)
+        transactions = await ankr_api.get_transactions(wallet.wallet_address)
         logger.info(f"Found {len(transactions)} Predict.fun transactions for {wallet.name}")
 
         for tx in transactions:
@@ -424,7 +424,7 @@ async def post_shutdown(app: Application):
             await _tracking_task
         except asyncio.CancelledError:
             pass
-    await bscscan_api.close()
+    await ankr_api.close()
     logger.info("Bot shutdown complete")
 
 

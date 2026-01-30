@@ -4,13 +4,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "")
+ANKR_API_KEY = os.getenv("ANKR_API_KEY", "")
 POLLING_INTERVAL = int(os.getenv("POLLING_INTERVAL", "30"))
 
 PREDICT_WEB_URL = "https://predict.fun"
-# Etherscan API V2 (supports BSC with chainid=56)
-BSCSCAN_API_URL = "https://api.etherscan.io/v2/api"
-BSC_CHAIN_ID = "56"
+# ANKR Advanced API for BSC
+ANKR_API_URL = f"https://rpc.ankr.com/multichain/{ANKR_API_KEY}" if ANKR_API_KEY else "https://rpc.ankr.com/multichain"
 
 # Predict.fun contract addresses on BNB Mainnet
 PREDICT_CONTRACTS = {
