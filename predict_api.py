@@ -1,45 +1,57 @@
 import aiohttp
 from typing import Optional
 from dataclasses import dataclass
-from config import (
-    ANKR_API_URL,
-    PREDICT_WEB_URL,
-    PREDICT_CONTRACTS,
-    MONITORED_CONTRACTS,
-)
+from config import PREDICTSCAN_API_URL, PREDICT_WEB_URL
 
 
 @dataclass
-class Transaction:
-    tx_hash: str
-    block_number: str
-    timestamp: str
-    from_address: str
-    to_address: str
-    value: float
-    contract_address: str
-    method_id: str
-    function_name: str
-    is_error: bool
+class Order:
+    order_hash: str
+    maker: str
+    asset_id: str
+    amount: float  # USDT amount
+    shares: float  # Token quantity
+    fee: float
+    side: str  # BUY or SELL
+    price: float
+    fill_count: int
+    first_fill_time: int
+    last_fill_time: int
+    tx_hashes: list[str]
+    market_title: str = ""
+    parent_event_title: str = ""
 
     @property
     def url(self) -> str:
-        return f"https://bscscan.com/tx/{self.tx_hash}"
+        return f"https://predictdotfun.predictscan.dev/order?orderHash={self.order_hash}"
 
     @property
-    def contract_name(self) -> str:
-        to_lower = self.to_address.lower()
-        for name, addr in PREDICT_CONTRACTS.items():
-            if addr.lower() == to_lower:
-                return name.replace("_", " ").title()
-        return "Unknown Contract"
+    def tx_url(self) -> str:
+        if self.tx_hashes:
+            return f"https://bscscan.com/tx/{self.tx_hashes[-1]}"
+        return ""
 
 
-class AnkrAPI:
+@dataclass
+class Position:
+    maker: str
+    asset_id: str
+    shares: float
+    avg_price: float
+    snapshot_time: int
+    market_title: str = ""
+    condition_id: str = ""
+
+    @property
+    def url(self) -> str:
+        return f"{PREDICT_WEB_URL}"
+
+
+class PredictscanAPI:
     def __init__(self):
-        self.api_url = ANKR_API_URL
+        self.api_url = PREDICTSCAN_API_URL
         self._session: Optional[aiohttp.ClientSession] = None
-        self._request_id = 0
+        self._markets_cache: dict = {}
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -50,132 +62,112 @@ class AnkrAPI:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def _rpc_request(self, method: str, params: dict) -> dict:
+    async def _request(self, endpoint: str, params: dict = None) -> dict:
         session = await self._get_session()
-        self._request_id += 1
-
-        payload = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-            "id": self._request_id
-        }
-
-        async with session.post(self.api_url, json=payload) as response:
-            if response.status == 200:
-                data = await response.json()
-                if "error" in data:
-                    print(f"[DEBUG API] Error: {data['error']}")
+        url = f"{self.api_url}{endpoint}"
+        try:
+            async with session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("success"):
+                        return data
+                    else:
+                        print(f"[DEBUG API] Error: {data.get('error', {}).get('message', 'Unknown error')}")
+                        return {}
+                else:
+                    text = await response.text()
+                    print(f"[DEBUG API] Request failed: {response.status} - {text[:200]}")
                     return {}
-                return data.get("result", {})
-            else:
-                text = await response.text()
-                print(f"[DEBUG API] Request failed: {response.status} - {text}")
-                return {}
-
-    async def get_transactions(self, address: str) -> list[Transaction]:
-        """Get all transactions for a wallet address using ANKR API."""
-        all_transactions = []
-
-        # 1. Get transactions by address
-        try:
-            params = {
-                "address": address,
-                "blockchain": ["bsc"],
-                "pageSize": 50,
-                "descOrder": True,
-            }
-            result = await self._rpc_request("ankr_getTransactionsByAddress", params)
-            txs = result.get("transactions", [])
-            print(f"[DEBUG] Regular txs: {len(txs)} for {address[:10]}...")
-
-            for item in txs:
-                tx = self._parse_transaction(item)
-                if tx:
-                    to_lower = tx.to_address.lower() if tx.to_address else ""
-                    if to_lower in MONITORED_CONTRACTS:
-                        print(f"[DEBUG] Found Predict tx: {tx.tx_hash[:16]}... to {tx.contract_name}")
-                        all_transactions.append(tx)
         except Exception as e:
-            print(f"Error fetching transactions: {e}")
+            print(f"[DEBUG API] Exception: {e}")
+            return {}
 
-        # 2. Get token transfers
+    async def get_market_by_asset(self, asset_id: str) -> dict:
+        """Get market info by asset ID."""
+        if asset_id in self._markets_cache:
+            return self._markets_cache[asset_id]
+
+        result = await self._request(f"/api/markets/by-asset/{asset_id}")
+        if result.get("success"):
+            market = result.get("data", {})
+            self._markets_cache[asset_id] = market
+            return market
+        return {}
+
+    async def get_orders_by_maker(self, maker_address: str, after_time: int = 0) -> list[Order]:
+        """Get orders by maker address."""
         try:
-            params = {
-                "address": [address],
-                "blockchain": ["bsc"],
-                "pageSize": 50,
-                "descOrder": True,
-            }
-            result = await self._rpc_request("ankr_getTokenTransfers", params)
-            transfers = result.get("transfers", [])
-            print(f"[DEBUG] Token transfers: {len(transfers)} for {address[:10]}...")
+            params = {"limit": 100}
+            if after_time > 0:
+                params["afterTime"] = after_time
 
-            for item in transfers:
-                to_addr = item.get("toAddress", "").lower()
-                from_addr = item.get("fromAddress", "").lower()
-                contract_addr = item.get("contractAddress", "").lower()
+            result = await self._request(f"/api/orders/by-maker/{maker_address}", params)
+            if not result.get("success"):
+                return []
 
-                # Check if transfer involves Predict.fun contracts
-                if to_addr in MONITORED_CONTRACTS or from_addr in MONITORED_CONTRACTS or contract_addr in MONITORED_CONTRACTS:
-                    value = float(item.get("value", "0"))
-                    decimals = int(item.get("tokenDecimals", 18))
-                    value = value / (10 ** decimals) if decimals > 0 else value
+            orders = []
+            for item in result.get("data", []):
+                # Get market info for title
+                asset_id = item.get("assetId", "")
+                market = await self.get_market_by_asset(asset_id) if asset_id else {}
 
-                    tx = Transaction(
-                        tx_hash=item.get("transactionHash", ""),
-                        block_number=str(item.get("blockNumber", "")),
-                        timestamp=item.get("timestamp", ""),
-                        from_address=from_addr,
-                        to_address=to_addr,
-                        value=value,
-                        contract_address=contract_addr,
-                        method_id="",
-                        function_name=f"{item.get('tokenSymbol', 'Token')} Transfer",
-                        is_error=False,
-                    )
-                    print(f"[DEBUG] Found token transfer: {tx.tx_hash[:16]}... {value} {item.get('tokenSymbol')}")
-                    all_transactions.append(tx)
+                order = Order(
+                    order_hash=item.get("orderHash", ""),
+                    maker=item.get("maker", ""),
+                    asset_id=asset_id,
+                    amount=float(item.get("amount", 0)),
+                    shares=float(item.get("shares", 0)),
+                    fee=float(item.get("fee", 0)),
+                    side=item.get("sideStr", item.get("side", "BUY")),
+                    price=float(item.get("price", 0)),
+                    fill_count=int(item.get("fillCount", 0)),
+                    first_fill_time=int(item.get("firstFillTime", 0)),
+                    last_fill_time=int(item.get("lastFillTime", 0)),
+                    tx_hashes=item.get("txHashes", []),
+                    market_title=market.get("marketTitle", item.get("marketTitle", "")),
+                    parent_event_title=market.get("parentEvent", {}).get("title", item.get("parentEventTitle", ""))
+                )
+                orders.append(order)
+
+            print(f"[DEBUG] Found {len(orders)} orders for {maker_address[:10]}...")
+            return orders
         except Exception as e:
-            print(f"Error fetching token transfers: {e}")
+            print(f"Error fetching orders for {maker_address}: {e}")
+            return []
 
-        return all_transactions
-
-    def _parse_transaction(self, item: dict) -> Optional[Transaction]:
-        """Parse transaction data from ANKR API response."""
+    async def get_positions_by_address(self, address: str) -> list[Position]:
+        """Get positions by address."""
         try:
-            value_str = item.get("value", "0")
-            # Handle hex values
-            if isinstance(value_str, str) and value_str.startswith("0x"):
-                value_wei = int(value_str, 16)
-            else:
-                value_wei = int(value_str) if value_str else 0
-            value_bnb = value_wei / 1e18
+            params = {"limit": 100, "includeConditionId": "true"}
+            result = await self._request(f"/api/user/positions/{address}", params)
+            if not result.get("success"):
+                return []
 
-            input_data = item.get("input", "")
-            method_id = input_data[:10] if len(input_data) >= 10 else ""
+            data = result.get("data", {})
+            positions_data = data.get("data", []) if isinstance(data, dict) else data
 
-            # Get method name from input or use default
-            method_name = item.get("method", "")
-            if not method_name and method_id:
-                method_name = method_id
+            positions = []
+            for item in positions_data:
+                asset_id = item.get("assetId", "")
+                market = await self.get_market_by_asset(asset_id) if asset_id else {}
 
-            return Transaction(
-                tx_hash=item.get("hash", item.get("transactionHash", "")),
-                block_number=str(item.get("blockNumber", "")),
-                timestamp=str(item.get("timestamp", "")),
-                from_address=item.get("from", item.get("fromAddress", "")),
-                to_address=item.get("to", item.get("toAddress", "")),
-                value=value_bnb,
-                contract_address=item.get("contractAddress", ""),
-                method_id=method_id,
-                function_name=method_name,
-                is_error=item.get("status") == "0" if "status" in item else False,
-            )
+                position = Position(
+                    maker=item.get("maker", ""),
+                    asset_id=asset_id,
+                    shares=float(item.get("shares", 0)),
+                    avg_price=float(item.get("avgPrice", 0)),
+                    snapshot_time=int(item.get("snapshotTime", 0)),
+                    market_title=market.get("marketTitle", ""),
+                    condition_id=item.get("conditionId", "")
+                )
+                positions.append(position)
+
+            print(f"[DEBUG] Found {len(positions)} positions for {address[:10]}...")
+            return positions
         except Exception as e:
-            print(f"Error parsing transaction: {e}")
-            return None
+            print(f"Error fetching positions for {address}: {e}")
+            return []
 
 
 # Global API instance
-ankr_api = AnkrAPI()
+predictscan_api = PredictscanAPI()

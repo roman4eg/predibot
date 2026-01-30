@@ -37,6 +37,30 @@ async def init_db():
                 UNIQUE(wallet_address, tx_hash)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS seen_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet_address TEXT NOT NULL,
+                order_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(wallet_address, order_hash)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS seen_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet_address TEXT NOT NULL,
+                position_id TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(wallet_address, position_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS last_check_times (
+                wallet_address TEXT PRIMARY KEY,
+                last_check_time INTEGER NOT NULL
+            )
+        """)
         await db.commit()
 
 
@@ -167,3 +191,72 @@ async def get_wallet_by_address(chat_id: int, wallet_address: str) -> Optional[W
                 positions_enabled=bool(row["positions_enabled"])
             )
         return None
+
+
+async def is_order_seen(wallet_address: str, order_hash: str) -> bool:
+    """Check if an order has been seen before."""
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM seen_orders WHERE wallet_address = ? AND order_hash = ?",
+            (wallet_address.lower(), order_hash.lower())
+        )
+        return await cursor.fetchone() is not None
+
+
+async def mark_order_seen(wallet_address: str, order_hash: str):
+    """Mark an order as seen."""
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        try:
+            await db.execute(
+                "INSERT INTO seen_orders (wallet_address, order_hash) VALUES (?, ?)",
+                (wallet_address.lower(), order_hash.lower())
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError:
+            pass
+
+
+async def is_position_seen(wallet_address: str, position_id: str) -> bool:
+    """Check if a position has been seen before."""
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM seen_positions WHERE wallet_address = ? AND position_id = ?",
+            (wallet_address.lower(), position_id)
+        )
+        return await cursor.fetchone() is not None
+
+
+async def mark_position_seen(wallet_address: str, position_id: str):
+    """Mark a position as seen."""
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        try:
+            await db.execute(
+                "INSERT INTO seen_positions (wallet_address, position_id) VALUES (?, ?)",
+                (wallet_address.lower(), position_id)
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError:
+            pass
+
+
+async def get_last_check_time(wallet_address: str) -> int:
+    """Get the last check time for a wallet. Returns 0 if never checked."""
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cursor = await db.execute(
+            "SELECT last_check_time FROM last_check_times WHERE wallet_address = ?",
+            (wallet_address.lower(),)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+async def update_last_check_time(wallet_address: str):
+    """Update the last check time for a wallet to current time."""
+    import time
+    current_time = int(time.time())
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO last_check_times (wallet_address, last_check_time) VALUES (?, ?)",
+            (wallet_address.lower(), current_time)
+        )
+        await db.commit()
